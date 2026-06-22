@@ -165,7 +165,7 @@ extern "C" {
         return -1;
     }
 
-    void filter_impl(uint8_t* buffer, int width, int height, int stride, int pixel_stride) {
+    void load_background_img(uint8_t* buffer, int width, int height, int stride, int pixel_stride) {
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
                 rgb* pixel_ptr = (rgb*)(buffer + y * stride + x * pixel_stride);
@@ -223,7 +223,10 @@ extern "C" {
                 background_img[bg_idx + 2] = rs[max_weight_index].b;
             }
         }
+    }
 
+    void filter_impl(uint8_t* buffer, int width, int height, int stride, int pixel_stride) {
+        load_background_img(buffer, width, height, stride, pixel_stride);
         movement_filter(buffer, motion_mask, width, height, stride, pixel_stride);
         noise_suppression(motion_mask, width, height, 1);
         hysteresis(motion_mask, width, height, HYSTERESIS_LOW, HYSTERESIS_HIGH);

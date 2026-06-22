@@ -1,0 +1,12 @@
+a
+car.png
+lib*
+build/
+*.png
+*.mp4
+*.webm
+temp
+data/
+*.o
+*.so
+*.a
