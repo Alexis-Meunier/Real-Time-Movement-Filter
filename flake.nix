@@ -18,13 +18,28 @@
   in {
     devShells.${system}.default = pkgs.mkShell {
       packages = with pkgs; [
-        cudaPackages.cuda_cudart
-        cudaPackages.cuda_nvcc
-        cudaPackages.cudnn
-        gcc
-        gnumake
-        cmake
-        pkg-config
+          gcc
+          gnumake
+          cmake
+          pkg-config
+
+          libpng
+          zlib
+          tbb
+          gbenchmark
+
+          # GStreamer Core & Base
+          gst_all_1.gstreamer
+          gst_all_1.gst-plugins-base
+          
+          # Added: Plugins holding standard encoders/decoders (like x264enc)
+          gst_all_1.gst-plugins-good
+          gst_all_1.gst-plugins-bad
+          gst_all_1.gst-plugins-ugly
+
+          cudaPackages.cuda_cudart
+          cudaPackages.cuda_nvcc
+          cudaPackages.cudnn
       ];
       shellHook = ''
         export CUDA_PATH=${pkgs.cudaPackages.cuda_cudart}
