@@ -18,33 +18,40 @@
   in {
     devShells.${system}.default = pkgs.mkShell {
       packages = with pkgs; [
-          gcc
-          gnumake
-          cmake
-          pkg-config
+        gcc
+        gnumake
+        cmake
+        ninja
+        pkg-config
 
-          libpng
-          zlib
-          tbb
-          gbenchmark
+        libpng
+        zlib
+        tbb
+        gbenchmark
 
-          # GStreamer Core & Base
-          gst_all_1.gstreamer
-          gst_all_1.gst-plugins-base
-          
-          # Added: Plugins holding standard encoders/decoders (like x264enc)
-          gst_all_1.gst-plugins-good
-          gst_all_1.gst-plugins-bad
-          gst_all_1.gst-plugins-ugly
+        gst_all_1.gstreamer
+        gst_all_1.gst-plugins-base
+        gst_all_1.gst-plugins-good
+        gst_all_1.gst-plugins-bad
+        gst_all_1.gst-plugins-ugly
 
-          cudaPackages.cuda_cudart
-          cudaPackages.cuda_nvcc
-          cudaPackages.cudnn
+        cudaPackages.cuda_nvcc
+        cudaPackages.cuda_cudart
+        cudaPackages.cuda_cudart.static
+        cudaPackages.cudatoolkit
+
+        sysprof
       ];
+
       shellHook = ''
-        export CUDA_PATH=${pkgs.cudaPackages.cuda_cudart}
-        export LD_LIBRARY_PATH=/run/opengl-driver/lib:${pkgs.cudaPackages.cuda_cudart}/lib:$LD_LIBRARY_PATH
-        export PATH=${pkgs.cudaPackages.cuda_nvcc}/bin:$PATH
+        export CC=${pkgs.gcc}/bin/gcc
+        export CXX=${pkgs.gcc}/bin/g++
+
+        export CUDA_PATH=${pkgs.cudaPackages.cudatoolkit}
+        export CUDAHOSTCXX=$CXX
+
+        export PATH=$CUDA_PATH/bin:$PATH
+        export LD_LIBRARY_PATH=/run/opengl-driver/lib:$CUDA_PATH/lib:$LD_LIBRARY_PATH
       '';
     };
   };
