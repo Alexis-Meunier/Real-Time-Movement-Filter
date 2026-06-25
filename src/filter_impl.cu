@@ -67,9 +67,14 @@ __global__ void remove_red_channel_inp(std::byte* buffer, int width, int height,
 }
 
 __device__ static reservoir d_global_rs[MAX_WIDTH * MAX_HEIGHT][K]; 
-__device__ static uint8_t d_background_img[MAX_WIDTH * MAX_HEIGHT * 3];
-__device__ static uint8_t d_motion_mask[MAX_WIDTH * MAX_HEIGHT];
-__device__ static uint8_t d_temp_mask[MAX_WIDTH * MAX_HEIGHT];
+__device__ static uint8_t *d_background_img;
+__device__ static uint8_t *d_motion_mask;
+__device__ static uint8_t *d_temp_mask;
+__device__ bool has_changed = false;
+static bool *input = nullptr;
+static bool *marker = nullptr;
+static bool *out = nullptr;
+static bool initialized = false;
 
 // Should use the static Image<curandState > rng_states; and
 // curand_init(seed, global_pixel_pos, 0, &randState_row[x]);
@@ -87,8 +92,110 @@ __device__ inline int safe_dist(uint8_t a, uint8_t b) {
     return b > a ? (b - a) : (a - b);
 }
 
-__device__ int find_matching_reservoir(rgb pixel, reservoir* rs, int& empty_idx) {
-    empty_idx = -1;
+__global__ void masking(uint8_t* buffer, uint8_t *mask, int width, int height, int stride, int pixel_stride) {
+    int y = blockIdx.y * blockDim.y + threadIdx.y; 
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (x >= width || y >= height) return;
+
+    if (mask[y * width + x] > 0) {
+        rgb* pixel_ptr = (rgb*)(buffer + y * stride + x * pixel_stride);
+        auto toAdd = mask[y * width + x] / 2;
+        if (255 - pixel_ptr->r < toAdd) {
+            pixel_ptr->r = 255;
+        } else {
+            pixel_ptr->r += toAdd;
+        }
+    }
+}
+
+__global__ void threshold_kernel(uint8_t* diff, bool* input, bool* marker,
+                                  int n, uint8_t th_low, uint8_t th_high) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) {
+        input[p]  = diff[p] >= th_low;
+        marker[p] = diff[p] >= th_high;
+    }
+}
+
+__global__ void to_uint8_mask(bool* out, uint8_t* mask, int n) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) mask[p] = out[p] ? 255 : 0;
+}
+
+__global__ void reconstruction(bool* input, bool* marker, bool* out, int width, int height, int n) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n || out[p] || !input[p]) return;
+    if (marker[p]) { out[p] = true; has_changed = true; return; }
+
+    int x = p % width, y = p / width;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = x + dx, ny = y + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+            if (out[ny * width + nx]) { out[p] = true; has_changed = true; }
+        }
+}
+
+__global__ void dilation(const uint8_t* src, uint8_t* dst, int width, int height, int opening_size) {
+    int y = blockIdx.y * blockDim.y + threadIdx.y; 
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (x >= width || y >= height) return;
+
+    uint8_t max_v = 0;
+    for (int dy = -opening_size; dy <= opening_size; ++dy) {
+        for (int dx = -opening_size; dx <= opening_size; ++dx) {
+            int nx = x + dx;
+            int ny = y + dy;
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                uint8_t val = src[ny * width + nx];
+                if (val > max_v) max_v = val;
+            }
+        }
+    }
+    dst[y * width + x] = max_v;
+}
+
+__global__ void erosion(const uint8_t* src, uint8_t* dst, int width, int height, int opening_size) {
+    int y = blockIdx.y * blockDim.y + threadIdx.y; 
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (x >= width || y >= height) return;
+
+    uint8_t min_v = 255;
+    for (int dy = -opening_size; dy <= opening_size; ++dy) {
+        for (int dx = -opening_size; dx <= opening_size; ++dx) {
+            int nx = x + dx;
+            int ny = y + dy;
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                uint8_t val = src[ny * width + nx];
+                if (val < min_v) min_v = val;
+            }
+        }
+    }
+    dst[y * width + x] = min_v;
+}
+
+__global__ void movement_filter(uint8_t* buffer, int width, int height, int stride, int pixel_stride) {
+    int y = blockIdx.y * blockDim.y + threadIdx.y; 
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (x >= width || y >= height) return;
+
+    rgb* pixel_ptr = (rgb*)(buffer + y * stride + x * pixel_stride);
+    int bg_idx = (y * width + x) * 3;
+    
+    int dr = safe_dist(pixel_ptr->r, d_background_img[bg_idx]);
+    int dg = safe_dist(pixel_ptr->g, d_background_img[bg_idx + 1]);
+    int db = safe_dist(pixel_ptr->b, d_background_img[bg_idx + 2]);
+    
+    int diff = (dr + dg + db) / 3;
+    d_motion_mask[y * width + x] = static_cast<uint8_t>(diff > 255 ? 255 : diff);
+}
+
+__device__ int find_matching_reservoir(const rgb& pixel, reservoir* rs) {
+    int m_idx = -1;
     for (int i = 0; i < K; ++i) {
         if (rs[i].w > 0) { 
             if (safe_dist(pixel.r, rs[i].r) < RGB_DIFF_THRESHOLD &&
@@ -96,11 +203,11 @@ __device__ int find_matching_reservoir(rgb pixel, reservoir* rs, int& empty_idx)
                 safe_dist(pixel.b, rs[i].b) < RGB_DIFF_THRESHOLD) {
                 return i;
             }
-        } else if (empty_idx == -1) {
-            empty_idx = i;
+        } else if (m_idx == -1) {
+            m_idx = i;
         }
     }
-    return -1;
+    return m_idx;
 }
 
 __global__ void load_background_img(uint8_t* buffer, int width, int height, int stride, int pixel_stride) {
@@ -115,10 +222,9 @@ __global__ void load_background_img(uint8_t* buffer, int width, int height, int 
     int pixel_id = y * width + x;
     reservoir* rs = d_global_rs[pixel_id];
 
-    int empty_idx = -1;
-    int m_idx = find_matching_reservoir(p, rs, empty_idx);
+    int m_idx = find_matching_reservoir(p, rs);
 
-    if (m_idx != -1) { 
+    if (m_idx != -1 && rs[m_idx].w > 0) { 
         rs[m_idx].w += 1;
         if (rs[m_idx].w > MAX_WEIGHTS) rs[m_idx].w = MAX_WEIGHTS;
 
@@ -126,11 +232,11 @@ __global__ void load_background_img(uint8_t* buffer, int width, int height, int 
         rs[m_idx].g = ((rs[m_idx].w - 1) * rs[m_idx].g + p.g) / rs[m_idx].w;
         rs[m_idx].b = ((rs[m_idx].w - 1) * rs[m_idx].b + p.b) / rs[m_idx].w;
     } 
-    else if (empty_idx != -1) { 
-        rs[empty_idx].r = p.r;
-        rs[empty_idx].g = p.g;
-        rs[empty_idx].b = p.b;
-        rs[empty_idx].w = 1;
+    else if (m_idx != -1 && rs[m_idx].w == 0) { 
+        rs[m_idx].r = p.r;
+        rs[m_idx].g = p.g;
+        rs[m_idx].b = p.b;
+        rs[m_idx].w = 1;
     } 
     else { 
         int min_idx = 0;
@@ -154,107 +260,28 @@ __global__ void load_background_img(uint8_t* buffer, int width, int height, int 
         }
     }
 
+    // then cap weights to MAX_WEIGHTS
     int max_weight_index = 0;
+    int max_weight = rs[0].w;
     for (int i = 1; i < K; ++i) {
-        if (rs[i].w > rs[max_weight_index].w) {
+        if (rs[i].w > max_weight) {
+            max_weight = rs[i].w;
             max_weight_index = i;
+        }
+        if (rs[i].w > MAX_WEIGHTS) {
+            rs[i].w = MAX_WEIGHTS;
         }
     }
     
     int bg_idx = pixel_id * 3;
-    d_background_img[bg_idx]     = rs[max_weight_index].r;
+    d_background_img[bg_idx] = rs[max_weight_index].r;
     d_background_img[bg_idx + 1] = rs[max_weight_index].g;
     d_background_img[bg_idx + 2] = rs[max_weight_index].b;
 }
 
-__global__ void movement_filter(uint8_t* buffer, int width, int height, int stride, int pixel_stride) {
-    int y = blockIdx.y * blockDim.y + threadIdx.y; 
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (x >= width || y >= height) return;
-
-    rgb* pixel_ptr = (rgb*)(buffer + y * stride + x * pixel_stride);
-    int bg_idx = (y * width + x) * 3;
-    
-    int dr = safe_dist(pixel_ptr->r, d_background_img[bg_idx]);
-    int dg = safe_dist(pixel_ptr->g, d_background_img[bg_idx + 1]);
-    int db = safe_dist(pixel_ptr->b, d_background_img[bg_idx + 2]);
-    
-    int diff = (dr + dg + db) / 3;
-    d_motion_mask[y * width + x] = static_cast<uint8_t>(diff > 255 ? 255 : diff);
-}
-
-__global__ void erosion(const uint8_t* src, uint8_t* dst, int width, int height, int opening_size) {
-    int y = blockIdx.y * blockDim.y + threadIdx.y; 
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (x >= width || y >= height) return;
-
-    uint8_t min_v = 255;
-    for (int dy = -opening_size; dy <= opening_size; ++dy) {
-        for (int dx = -opening_size; dx <= opening_size; ++dx) {
-            int nx = x + dx;
-            int ny = y + dy;
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                uint8_t val = src[ny * width + nx];
-                if (val < min_v) min_v = val;
-            }
-        }
-    }
-    dst[y * width + x] = min_v;
-}
-
-__global__ void dilation(const uint8_t* src, uint8_t* dst, int width, int height, int opening_size) {
-    int y = blockIdx.y * blockDim.y + threadIdx.y; 
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (x >= width || y >= height) return;
-
-    uint8_t max_v = 0;
-    for (int dy = -opening_size; dy <= opening_size; ++dy) {
-        for (int dx = -opening_size; dx <= opening_size; ++dx) {
-            int nx = x + dx;
-            int ny = y + dy;
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                uint8_t val = src[ny * width + nx];
-                if (val > max_v) max_v = val;
-            }
-        }
-    }
-    dst[y * width + x] = max_v;
-}
-
-__device__ bool has_changed;
-
-__global__ void reconstruction(input, marker, out) {
-    int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (out[p] || !input[p])
-        return;
-    if (marker[p]) {
-        out[p] = true;
-        has_changed = true;
-        return;
-    }
-    for (int q : neighbors(p))
-    {
-        if (out[q]) {
-            out[p] = true;
-            has_changed = true;
-        }
-    }
-}
-
-__global__ void masking(uint8_t* buffer, int width, int height, int stride, int pixel_stride) {
-    int y = blockIdx.y * blockDim.y + threadIdx.y; 
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (x >= width || y >= height) return;
-
-    if (d_motion_mask[y * width + x] > 0) {
-        rgb* pixel_ptr = (rgb*)(buffer + y * stride + x * pixel_stride);
-        pixel_ptr->r = 255; 
-    }
-}
+static Image<curandState > rng_states;
+curand_init(seed, global_pixel_pos, 0, &randState_row[x]);
+float rand_val = curand_uniform(&randState_row[x]);
 
 namespace
 {
@@ -283,13 +310,27 @@ namespace
 extern "C" {
     void filter_impl(uint8_t* src_buffer, int width, int height, int src_stride, int pixel_stride)
     {
-        load_logo();
+        cudaError_t err;
+        if (!initialized) {
+            err = cudaMalloc(&d_background_img, width * height * 3 * sizeof(uint8_t));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMalloc(&d_motion_mask, width * height * sizeof(uint8_t));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMalloc(&d_temp_mask, width * height * sizeof(uint8_t));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMalloc(&input, width * height * sizeof(bool));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMalloc(&marker, width * height * sizeof(bool));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMalloc(&out, width * height * sizeof(bool));
+            CHECK_CUDA_ERROR(err);
+            initialized = true;
+        }
 
         assert(sizeof(rgb) == pixel_stride);
-        std::byte* dBuffer;
+        std::uint8_t* dBuffer;
         size_t pitch;
 
-        cudaError_t err;
         
         err = cudaMallocPitch(&dBuffer, &pitch, width * sizeof(rgb), height);
         CHECK_CUDA_ERROR(err);
@@ -303,18 +344,33 @@ extern "C" {
         dim3 blockSize(16, 16);
         dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (height + blockSize.y - 1) / blockSize.y);
 
+        // Compute background
         load_background_img<<<gridSize, blockSize>>>(dBuffer, width, height, pitch, pixel_stride);
+        // Get the movement filter
         movement_filter<<<gridSize, blockSize>>>(dBuffer, width, height, pitch, pixel_stride);
+        // Noise Supprsion
         erosion<<<gridSize, blockSize>>>(d_motion_mask, d_temp_mask, width, height, 1);
         dilation<<<gridSize, blockSize>>>(d_temp_mask, d_motion_mask, width, height, 1);
 
-        // IDK what input and black_image are but w/e
-        out = black_image;
-        has_changed = false;
-        while (has_changed)
-            reconstruction<<<>>>(input, marker, out);
+        int threads = 256;
+        int blocks = (width * height + threads - 1) / threads;
+        // Compute input and marker
+        threshold_kernel<<<blocks, threads>>>(d_motion_mask, input, marker, width * height, HYSTERESIS_LOW, HYSTERESIS_HIGH);
+        // Set output to false everywhere
+        cudaMemset(out, 0, width * height * sizeof(bool));
+        // Hysteresis
+        bool host_changed;
+        do {
+            bool zero = false;
+            cudaMemcpyToSymbol(&has_changed, &zero, sizeof(bool));
+            reconstruction<<<blocks, threads>>>(input, marker, out, width * height);
+            cudaMemcpyFromSymbol(&host_changed, &has_changed, sizeof(bool));
+        } while (host_changed);
 
-        masking<<<gridSize, blockSize>>>(dBuffer, width, height, pitch, pixel_stride);
+        // convert out to a uint8_t mask for computations
+        to_uint8_mask<<<blocks, threads>>>(out, d_motion_mask, width * height);
+        // superpose mask/frame with a red color
+        masking<<<gridSize, blockSize>>>(dBuffer, d_motion_mask, width, height, pitch, pixel_stride);
 
         err = cudaMemcpy2D(src_buffer, src_stride, dBuffer, pitch, width * sizeof(rgb), height, cudaMemcpyDefault);
         CHECK_CUDA_ERROR(err);

@@ -7,12 +7,11 @@
 #define MAX_WEIGHTS 1000
 #define K 5
 
-// Default subject guidelines for low/high hysteresis thresholds
 #define HYSTERESIS_LOW 15
 #define HYSTERESIS_HIGH 50
 
-#define MAX_PASSES 1000
-#define SPACES 1
+#define MAX_PASSES 100
+#define SPACES 8
 
 struct rgb {
     uint8_t r, g, b;
@@ -243,6 +242,44 @@ extern "C" {
         }
     }
 
+    void reset_reservoirs(uint8_t* buffer, int width, int height)
+    {
+        int nb_changes = 0;
+        int top = 0;
+        for (int y = 0; y < height; ++y)
+        {
+            for (int x = 0; x < width; ++x)
+            {
+                int index = y * width + x;
+                reservoir* curr_rs = rs[index];
+                if (buffer[index * 3] != background_img[index * 3] ||
+                    buffer[index * 3 + 1] != background_img[index * 3 + 1] ||
+                    buffer[index * 3 + 2] != background_img[index * 3 + 2])
+                {
+                    stack_x[top] = x;
+                    stack_y[top] = y;
+                    top++;
+                    nb_changes++;
+                }
+            }
+        }
+        if (nb_changes > width * height / 2)
+        {
+            while (top > 0)
+            {
+                top--;
+                int cx = stack_x[top];
+                int cy = stack_y[top];
+                int index = cy * width + cx;
+                reservoir* curr_rs = rs[index];
+                for (int i = 0; i < K; ++i)
+                {
+                    curr_rs[i].w = 0;
+                }
+            }
+        }
+    }
+
     void filter_impl(uint8_t* buffer, int width, int height, int stride, int pixel_stride) {
         if (!initialized) {
             rs = new reservoir*[width * height];
@@ -268,6 +305,7 @@ extern "C" {
                 load_background_img(buffer, width, height, stride, pixel_stride);
             }
         }
+        // reset_reservoirs(buffer, width, height);
         movement_filter(buffer, motion_mask, width, height, stride, pixel_stride);
         noise_suppression(motion_mask, width, height, 2);
         hysteresis(motion_mask, width, height, HYSTERESIS_LOW, HYSTERESIS_HIGH);
