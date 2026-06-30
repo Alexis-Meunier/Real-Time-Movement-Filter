@@ -68,8 +68,8 @@ __global__ void remove_red_channel_inp(std::byte* buffer, int width, int height,
 }
 
 __device__ bool has_changed = false;
-__device__ static reservoir **d_global_rs = nullptr;
 __device__ static uint8_t *d_background_img;
+__device__ static reservoir *d_global_rs = nullptr;
 
 static uint8_t *d_motion_mask;
 static uint8_t *d_temp_mask;
@@ -209,16 +209,11 @@ __device__ int find_matching_reservoir(const rgb& pixel, reservoir* rs) {
     return m_idx;
 }
 
-__global__ void init_reservoirs(int width, int height) {
-    if (d_global_rs != nullptr) return;
-
-    d_global_rs = (reservoir**)malloc(width * height * sizeof(reservoir*));
-    for (int i = 0; i < width * height; ++i) {
-        d_global_rs[i] = (reservoir*)malloc(K * sizeof(reservoir));
-        for (int j = 0; j < K; ++j) {
-            d_global_rs[i][j].w = 0;
-        }
-    }
+__global__ void init_reservoirs(reservoir* rs_flat, int n) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    for (int j = 0; j < K; ++j)
+        rs_flat[p * K + j].w = 0;
 }
 
 __global__ void load_background_img(uint8_t* buffer, int width, int height, int stride, int pixel_stride, int nb_passes) {
@@ -231,7 +226,7 @@ __global__ void load_background_img(uint8_t* buffer, int width, int height, int 
     rgb p = *pixel_ptr;
 
     int pixel_id = y * width + x;
-    reservoir* rs = d_global_rs[pixel_id];
+    reservoir* rs = d_global_rs + pixel_id * K;
 
     int m_idx = find_matching_reservoir(p, rs);
 
@@ -337,7 +332,17 @@ extern "C" {
             CHECK_CUDA_ERROR(err);
             err = cudaMalloc(&out, width * height * sizeof(bool));
             CHECK_CUDA_ERROR(err);
-            init_reservoirs<<<1, 1>>>(width, height);
+            reservoir* d_rs_flat;
+            err = cudaMalloc(&d_rs_flat, width * height * K * sizeof(reservoir));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMemcpyToSymbol(d_global_rs, &d_rs_flat, sizeof(d_rs_flat));
+            CHECK_CUDA_ERROR(err);
+
+            int init_threads = 256;
+            int init_blocks = (width * height + init_threads - 1) / init_threads;
+            init_reservoirs<<<init_blocks, init_threads>>>(d_rs_flat, width * height);
+            err = cudaDeviceSynchronize();
+            CHECK_CUDA_ERROR(err);
             err = cudaDeviceSynchronize();
             CHECK_CUDA_ERROR(err);
 
@@ -354,7 +359,7 @@ extern "C" {
         err = cudaMemcpy2D(dBuffer, pitch, src_buffer, src_stride, width * sizeof(rgb), height, cudaMemcpyHostToDevice);
         CHECK_CUDA_ERROR(err);
 
-        dim3 blockSize(16, 16);
+        dim3 blockSize(32, 32);
         dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (height + blockSize.y - 1) / blockSize.y);
 
         if (nb_passes % SPACES == 0) {
