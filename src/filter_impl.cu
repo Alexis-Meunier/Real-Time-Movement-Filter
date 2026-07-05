@@ -125,7 +125,7 @@ __global__ void to_uint8_mask(bool* out, uint8_t* mask, int n) {
     if (p < n) mask[p] = out[p] ? 255 : 0;
 }
 
-#define TILE 16
+#define TILE 32
 
 __global__ void reconstruction_tiled(const bool* __restrict__ input,
                                       const bool* __restrict__ marker,
