@@ -75,6 +75,8 @@ __device__ static reservoir *d_global_rs = nullptr;
 
 static uint8_t *d_motion_mask;
 static uint8_t *d_temp_mask;
+static int *d_changed;
+static cudaStream_t stream;
 static bool *input = nullptr;
 static bool *marker = nullptr;
 static bool *out = nullptr;
@@ -123,6 +125,47 @@ __global__ void threshold_kernel(uint8_t* diff, bool* input, bool* marker, int n
 __global__ void to_uint8_mask(bool* out, uint8_t* mask, int n) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < n) mask[p] = out[p] ? 255 : 0;
+}
+
+__global__ void markStrongEdges(const uint8_t* __restrict__ temp_mask,
+                                 uint8_t* __restrict__ mask,
+                                 int width, int height)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    mask[idx] = (temp_mask[idx] >= HYSTERESIS_HIGH) ? 255 : 0;
+}
+
+__global__ void propagateWeakEdges(const uint8_t* __restrict__ temp_mask,
+                                    uint8_t* __restrict__ mask,
+                                    int width, int height,
+                                    int* d_changed)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    if (mask[idx] != 0) return;
+    if (temp_mask[idx] < HYSTERESIS_LOW) return;
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        int ny = y + dy;
+        if (ny < 0 || ny >= height) continue;
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = x + dx;
+            if (nx < 0 || nx >= width) continue;
+            if (mask[ny * width + nx] == 255) {
+                mask[idx] = 255;
+                *d_changed = 1;
+                return;
+            }
+        }
+    }
 }
 
 __global__ void reconstruction(bool* input, bool* marker, bool* out, int width, int height) {
@@ -340,6 +383,10 @@ extern "C" {
             CHECK_CUDA_ERROR(err);
             err = cudaMemcpyToSymbol(d_global_rs, &d_rs_flat, sizeof(d_rs_flat));
             CHECK_CUDA_ERROR(err);
+            err = cudaMalloc(&d_changed, sizeof(int));
+            CHECK_CUDA_ERROR(err);
+            err = cudaStreamCreate(&stream);
+            CHECK_CUDA_ERROR(err);
 
             int init_threads = 256;
             int init_blocks = (width * height + init_threads - 1) / init_threads;
@@ -377,27 +424,22 @@ extern "C" {
         erosion<<<gridSize, blockSize>>>(d_motion_mask, d_temp_mask, width, height, 2);
         dilation<<<gridSize, blockSize>>>(d_temp_mask, d_motion_mask, width, height, 2);
 
-        int threads = 256;
-        int blocks = (width * height + threads - 1) / threads;
-        // Compute input and marker
-        threshold_kernel<<<blocks, threads>>>(d_motion_mask, input, marker, width * height);
-        // Set output to false everywhere
-        cudaMemset(out, 0, width * height * sizeof(bool));
+        err = cudaMemcpyAsync(d_temp_mask, d_motion_mask,
+                            width * height * sizeof(uint8_t),
+                            cudaMemcpyDeviceToDevice, stream);
+        CHECK_CUDA_ERROR(err);
 
-        bool host_changed;
+        markStrongEdges<<<gridSize, blockSize, 0, stream>>>(d_temp_mask, d_motion_mask, width, height);
+
+        int h_changed;
         do {
-            nb_loop++;
-            bool zero = false;
-            cudaMemcpyToSymbol(has_changed, &zero, sizeof(bool));
-            reconstruction<<<blocks, threads>>>(input, marker, out, width, height);
-            // Bit operators are faster hopefully ?
-            if (!(nb_loop & 0x3))
-                cudaMemcpyFromSymbol(&host_changed, has_changed, sizeof(bool));
-        } while (host_changed);
+            cudaMemsetAsync(d_changed, 0, sizeof(int), stream);
+            propagateWeakEdges<<<gridSize, blockSize, 0, stream>>>(d_temp_mask, d_motion_mask, width, height, d_changed);
+            cudaMemcpyAsync(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+        } while (h_changed);
 
-        // convert out to a uint8_t mask for computations
-        to_uint8_mask<<<blocks, threads>>>(out, d_motion_mask, width * height);
-        // superpose mask/frame with a red color
+        // d_motion_mask is now the final 0/255 hysteresis mask — use it directly.
         masking<<<gridSize, blockSize>>>(dBuffer, d_motion_mask, width, height, pitch, pixel_stride);
 
         err = cudaMemcpy2D(src_buffer, src_stride, dBuffer, pitch, width * sizeof(rgb), height, cudaMemcpyDefault);
