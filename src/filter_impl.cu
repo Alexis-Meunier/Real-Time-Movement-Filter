@@ -75,8 +75,6 @@ __device__ static reservoir *d_global_rs = nullptr;
 
 static uint8_t *d_motion_mask;
 static uint8_t *d_temp_mask;
-static int *d_changed;
-static cudaStream_t stream;
 static bool *input = nullptr;
 static bool *marker = nullptr;
 static bool *out = nullptr;
@@ -127,44 +125,105 @@ __global__ void to_uint8_mask(bool* out, uint8_t* mask, int n) {
     if (p < n) mask[p] = out[p] ? 255 : 0;
 }
 
-__global__ void markStrongEdges(const uint8_t* __restrict__ temp_mask,
-                                 uint8_t* __restrict__ mask,
-                                 int width, int height)
+#define TILE 16
+
+__global__ void reconstruction_tiled(const bool* __restrict__ input,
+                                      const bool* __restrict__ marker,
+                                      bool* __restrict__ out,
+                                      int width, int height)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
+    __shared__ bool sh_out[TILE + 2][TILE + 2];
+    __shared__ bool sh_input[TILE][TILE];
+    __shared__ bool sh_marker[TILE][TILE];
+    __shared__ int sh_iter_changed;
+    __shared__ int sh_block_changed;
 
-    int idx = y * width + x;
-    mask[idx] = (temp_mask[idx] >= HYSTERESIS_HIGH) ? 255 : 0;
-}
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int x = blockIdx.x * TILE + tx;
+    int y = blockIdx.y * TILE + ty;
+    bool valid = (x < width && y < height);
+    int idx = valid ? y * width + x : 0;
 
-__global__ void propagateWeakEdges(const uint8_t* __restrict__ temp_mask,
-                                    uint8_t* __restrict__ mask,
-                                    int width, int height,
-                                    int* d_changed)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
+    sh_input[ty][tx] = valid ? input[idx] : false;
+    sh_marker[ty][tx] = valid ? marker[idx] : false;
+    sh_out[ty + 1][tx + 1] = valid ? out[idx] : false;
 
-    int idx = y * width + x;
-    if (mask[idx] != 0) return;
-    if (temp_mask[idx] < HYSTERESIS_LOW) return;
+    bool rightEdge = (tx == TILE - 1) || (x == width - 1);
+    bool bottomEdge = (ty == TILE - 1) || (y == height - 1);
 
-    for (int dy = -1; dy <= 1; ++dy) {
-        int ny = y + dy;
-        if (ny < 0 || ny >= height) continue;
-        for (int dx = -1; dx <= 1; ++dx) {
-            if (dx == 0 && dy == 0) continue;
-            int nx = x + dx;
-            if (nx < 0 || nx >= width) continue;
-            if (mask[ny * width + nx] == 255) {
-                mask[idx] = 255;
-                *d_changed = 1;
-                return;
+    if (tx == 0) {
+        int gx = x - 1;
+        sh_out[ty + 1][0] = (gx >= 0 && y < height) ? out[y * width + gx] : false;
+    }
+    if (rightEdge) {
+        int gx = x + 1;
+        sh_out[ty + 1][tx + 2] = (gx < width && y < height) ? out[y * width + gx] : false;
+    }
+    if (ty == 0) {
+        int gy = y - 1;
+        sh_out[0][tx + 1] = (gy >= 0 && x < width) ? out[gy * width + x] : false;
+    }
+    if (bottomEdge) {
+        int gy = y + 1;
+        sh_out[ty + 2][tx + 1] = (gy < height && x < width) ? out[gy * width + x] : false;
+    }
+    if (tx == 0 && ty == 0) {
+        int gx = x - 1, gy = y - 1;
+        sh_out[0][0] = (gx >= 0 && gy >= 0) ? out[gy * width + gx] : false;
+    }
+    if (rightEdge && ty == 0) {
+        int gx = x + 1;
+        int gy = y - 1;
+        sh_out[0][tx + 2] = (gx < width && gy >= 0) ? out[gy * width + gx] : false;
+    }
+    if (tx == 0 && bottomEdge) {
+        int gx = x - 1;
+        int gy = y + 1;
+        sh_out[ty + 2][0] = (gx >= 0 && gy < height) ? out[gy * width + gx] : false;
+    }
+    if (rightEdge && bottomEdge) {
+        int gx = x + 1;
+        int gy = y + 1;
+        sh_out[ty + 2][tx + 2] = (gx < width && gy < height) ? out[gy * width + gx] : false;
+    }
+
+    if (tx == 0 && ty == 0) sh_block_changed = 0;
+    __syncthreads();
+
+    const int MAX_LOCAL_ITERS = 2 * TILE;
+    for (int iter = 0; iter < MAX_LOCAL_ITERS; ++iter) {
+        if (tx == 0 && ty == 0) sh_iter_changed = 0;
+        __syncthreads();
+
+        bool mine = false;
+        if (valid && !sh_out[ty + 1][tx + 1] && sh_input[ty][tx]) {
+            if (sh_marker[ty][tx]) {
+                mine = true;
+            } else {
+                for (int dy = -1; dy <= 1 && !mine; ++dy)
+                    for (int dx = -1; dx <= 1 && !mine; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        if (sh_out[ty + 1 + dy][tx + 1 + dx]) mine = true;
+                    }
             }
         }
+        __syncthreads();
+
+        if (mine) {
+            sh_out[ty + 1][tx + 1] = true;
+            atomicOr(&sh_iter_changed, 1);
+            atomicOr(&sh_block_changed, 1);
+        }
+        __syncthreads();
+
+        if (sh_iter_changed == 0) break;
+    }
+
+    if (valid) out[idx] = sh_out[ty + 1][tx + 1];
+
+    if (tx == 0 && ty == 0 && sh_block_changed) {
+        has_changed = true;
     }
 }
 
@@ -383,10 +442,6 @@ extern "C" {
             CHECK_CUDA_ERROR(err);
             err = cudaMemcpyToSymbol(d_global_rs, &d_rs_flat, sizeof(d_rs_flat));
             CHECK_CUDA_ERROR(err);
-            err = cudaMalloc(&d_changed, sizeof(int));
-            CHECK_CUDA_ERROR(err);
-            err = cudaStreamCreate(&stream);
-            CHECK_CUDA_ERROR(err);
 
             int init_threads = 256;
             int init_blocks = (width * height + init_threads - 1) / init_threads;
@@ -424,22 +479,23 @@ extern "C" {
         erosion<<<gridSize, blockSize>>>(d_motion_mask, d_temp_mask, width, height, 2);
         dilation<<<gridSize, blockSize>>>(d_temp_mask, d_motion_mask, width, height, 2);
 
-        err = cudaMemcpyAsync(d_temp_mask, d_motion_mask,
-                            width * height * sizeof(uint8_t),
-                            cudaMemcpyDeviceToDevice, stream);
-        CHECK_CUDA_ERROR(err);
+        dim3 reconBlock(TILE, TILE);
+        dim3 reconGrid((width + TILE - 1) / TILE, (height + TILE - 1) / TILE);
 
-        markStrongEdges<<<gridSize, blockSize, 0, stream>>>(d_temp_mask, d_motion_mask, width, height);
+        threshold_kernel<<<reconGrid, reconBlock>>>(d_motion_mask, input, marker, width * height);
+        cudaMemset(out, 0, width * height * sizeof(bool));
 
-        int h_changed;
+        bool host_changed;
         do {
-            cudaMemsetAsync(d_changed, 0, sizeof(int), stream);
-            propagateWeakEdges<<<gridSize, blockSize, 0, stream>>>(d_temp_mask, d_motion_mask, width, height, d_changed);
-            cudaMemcpyAsync(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost, stream);
-            cudaStreamSynchronize(stream);
-        } while (h_changed);
+            bool zero = false;
+            cudaMemcpyToSymbol(has_changed, &zero, sizeof(bool));
+            reconstruction_tiled<<<reconGrid, reconBlock>>>(input, marker, out, width, height);
+            cudaMemcpyFromSymbol(&host_changed, has_changed, sizeof(bool));
+        } while (host_changed);
 
-        // d_motion_mask is now the final 0/255 hysteresis mask — use it directly.
+        // convert out to a uint8_t mask for computations
+        to_uint8_mask<<<reconGrid, reconBlock>>>(out, d_motion_mask, width * height);
+        // superpose mask/frame with a red color
         masking<<<gridSize, blockSize>>>(dBuffer, d_motion_mask, width, height, pitch, pixel_stride);
 
         err = cudaMemcpy2D(src_buffer, src_stride, dBuffer, pitch, width * sizeof(rgb), height, cudaMemcpyDefault);
