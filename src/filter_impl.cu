@@ -18,6 +18,8 @@
 #define MAX_PASSES 100
 #define SPACES 8
 
+#define OPENING_SIZE 2
+
 #define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
 template <typename T>
 void check(T err, const char* const func, const char* const file,
@@ -246,45 +248,74 @@ __global__ void reconstruction(bool* input, bool* marker, bool* out, int width, 
         }
 }
 
-__global__ void dilation(const uint8_t* src, uint8_t* dst, int width, int height, int opening_size) {
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+__device__ inline int clampi(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+__global__ void erode_h(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst,
+                         int width, int height, int r) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= width || y >= height) return;
 
-    uint8_t max_v = 0;
-    for (int dy = -opening_size; dy <= opening_size; ++dy) {
-        for (int dx = -opening_size; dx <= opening_size; ++dx) {
-            int nx = x + dx;
-            int ny = y + dy;
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                uint8_t val = src[ny * width + nx];
-                if (val > max_v) max_v = val;
-            }
-        }
+    int m = 255;
+    for (int dx = -r; dx <= r; ++dx) {
+        int nx = clampi(x + dx, 0, width - 1);
+        m = min(m, (int)src[y * width + nx]);
     }
-    dst[y * width + x] = max_v;
+
+    dst[y * width + x] = (uint8_t)m;
 }
 
-__global__ void erosion(const uint8_t* src, uint8_t* dst, int width, int height, int opening_size) {
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+__global__ void erode_v(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst,
+                         int width, int height, int r) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= width || y >= height) return;
 
-    uint8_t min_v = 255;
-    for (int dy = -opening_size; dy <= opening_size; ++dy) {
-        for (int dx = -opening_size; dx <= opening_size; ++dx) {
-            int nx = x + dx;
-            int ny = y + dy;
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                uint8_t val = src[ny * width + nx];
-                if (val < min_v) min_v = val;
-            }
-        }
+    int m = 255;
+    for (int dy = -r; dy <= r; ++dy) {
+        int ny = clampi(y + dy, 0, height - 1);
+        m = min(m, (int)src[ny * width + x]);
     }
-    dst[y * width + x] = min_v;
+
+    dst[y * width + x] = (uint8_t)m;
 }
+
+__global__ void dilate_h(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst,
+                          int width, int height, int r) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) return;
+
+    int m = 0;
+    for (int dx = -r; dx <= r; ++dx) {
+        int nx = clampi(x + dx, 0, width - 1);
+        m = max(m, (int)src[y * width + nx]);
+    }
+
+    dst[y * width + x] = (uint8_t)m;
+}
+
+__global__ void dilate_v(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst,
+                          int width, int height, int r) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) return;
+
+    int m = 0;
+    for (int dy = -r; dy <= r; ++dy) {
+        int ny = clampi(y + dy, 0, height - 1);
+        m = max(m, (int)src[ny * width + x]);
+    }
+
+    dst[y * width + x] = (uint8_t)m;
+}
+
 
 __global__ void movement_filter(uint8_t* buffer, uint8_t *mask, int width, int height, int stride, int pixel_stride) {
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -508,8 +539,11 @@ extern "C" {
         // Get the movement filter
         movement_filter<<<gridSize, blockSize>>>(dBuffer, d_motion_mask, width, height, pitch, pixel_stride);
         // Noise Suppression
-        erosion<<<gridSize, blockSize>>>(d_motion_mask, d_temp_mask, width, height, 2);
-        dilation<<<gridSize, blockSize>>>(d_temp_mask, d_motion_mask, width, height, 2);
+        // Noise Suppression
+        erode_h<<<gridSize, blockSize>>>(d_motion_mask, d_temp_mask,  width, height, OPENING_SIZE);
+        erode_v<<<gridSize, blockSize>>>(d_temp_mask,  d_motion_mask, width, height, OPENING_SIZE);
+        dilate_h<<<gridSize, blockSize>>>(d_motion_mask, d_temp_mask,  width, height, OPENING_SIZE);
+        dilate_v<<<gridSize, blockSize>>>(d_temp_mask,  d_motion_mask, width, height, OPENING_SIZE);
 
         dim3 reconBlock(TILE, TILE);
         dim3 reconGrid((width + TILE - 1) / TILE, (height + TILE - 1) / TILE);
