@@ -10,6 +10,8 @@
 #define MAX_WEIGHTS 1000
 #define K 5
 
+#define LOOP_DEVICE_COPY 4
+
 #define HYSTERESIS_LOW 15
 #define HYSTERESIS_HIGH 50
 
@@ -78,6 +80,7 @@ static bool *marker = nullptr;
 static bool *out = nullptr;
 static bool initialized = false;
 static int nb_passes = 0;
+static int nb_loop = 0;
 
 __device__ uint32_t xorshift32(uint32_t* state) {
     uint32_t x = *state;
@@ -383,10 +386,13 @@ extern "C" {
 
         bool host_changed;
         do {
+            nb_loop++;
             bool zero = false;
             cudaMemcpyToSymbol(has_changed, &zero, sizeof(bool));
             reconstruction<<<blocks, threads>>>(input, marker, out, width, height);
-            cudaMemcpyFromSymbol(&host_changed, has_changed, sizeof(bool));
+            // Bit operators are faster hopefully ?
+            if (!(nb_loop & 0x3))
+                cudaMemcpyFromSymbol(&host_changed, has_changed, sizeof(bool));
         } while (host_changed);
 
         // convert out to a uint8_t mask for computations
