@@ -36,10 +36,6 @@ struct rgb {
     uint8_t r, g, b;
 };
 
-struct reservoir {
-    uint8_t r, g, b;
-    int w;
-};
 
 __constant__ uint8_t* logo;
 
@@ -70,8 +66,17 @@ __global__ void remove_red_channel_inp(std::byte* buffer, int width, int height,
 }
 
 __device__ bool has_changed = false;
-__device__ static uint8_t *d_background_img;
-__device__ static reservoir *d_global_rs = nullptr;
+
+// Background
+__device__ static uint8_t *d_bg_r;
+__device__ static uint8_t *d_bg_g;
+__device__ static uint8_t *d_bg_b;
+
+// Reservoirs
+__device__ static uint8_t *d_rs_r;
+__device__ static uint8_t *d_rs_g;
+__device__ static uint8_t *d_rs_b;
+__device__ static int *d_rs_w;
 
 static uint8_t *d_motion_mask;
 static uint8_t *d_temp_mask;
@@ -288,23 +293,24 @@ __global__ void movement_filter(uint8_t* buffer, uint8_t *mask, int width, int h
     if (x >= width || y >= height) return;
 
     rgb* pixel_ptr = (rgb*)(buffer + y * stride + x * pixel_stride);
-    int bg_idx = (y * width + x) * 3;
+    int pixel_id = y * width + x;
 
-    int dr = safe_dist(pixel_ptr->r, d_background_img[bg_idx]);
-    int dg = safe_dist(pixel_ptr->g, d_background_img[bg_idx + 1]);
-    int db = safe_dist(pixel_ptr->b, d_background_img[bg_idx + 2]);
+    int dr = safe_dist(pixel_ptr->r, d_bg_r[pixel_id]);
+    int dg = safe_dist(pixel_ptr->g, d_bg_g[pixel_id]);
+    int db = safe_dist(pixel_ptr->b, d_bg_b[pixel_id]);
 
     int diff = (dr + dg + db) / 3;
-    mask[y * width + x] = static_cast<uint8_t>(diff > 255 ? 255 : diff);
+    mask[pixel_id] = static_cast<uint8_t>(diff > 255 ? 255 : diff);
 }
 
-__device__ int find_matching_reservoir(const rgb& pixel, reservoir* rs) {
+__device__ int find_matching_reservoir(const rgb& pixel, int rs_stride, int pixel_id) {
     int m_idx = -1;
     for (int i = 0; i < K; ++i) {
-        if (rs[i].w > 0) {
-            if (safe_dist(pixel.r, rs[i].r) < RGB_DIFF_THRESHOLD &&
-                safe_dist(pixel.g, rs[i].g) < RGB_DIFF_THRESHOLD &&
-                safe_dist(pixel.b, rs[i].b) < RGB_DIFF_THRESHOLD) {
+        int off = i * rs_stride + pixel_id;
+        if (d_rs_w[off] > 0) {
+            if (safe_dist(pixel.r, d_rs_r[off]) < RGB_DIFF_THRESHOLD &&
+                safe_dist(pixel.g, d_rs_g[off]) < RGB_DIFF_THRESHOLD &&
+                safe_dist(pixel.b, d_rs_b[off]) < RGB_DIFF_THRESHOLD) {
                 return i;
             }
         } else if (m_idx == -1) {
@@ -312,13 +318,6 @@ __device__ int find_matching_reservoir(const rgb& pixel, reservoir* rs) {
         }
     }
     return m_idx;
-}
-
-__global__ void init_reservoirs(reservoir* rs_flat, int n) {
-    int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= n) return;
-    for (int j = 0; j < K; ++j)
-        rs_flat[p * K + j].w = 0;
 }
 
 __global__ void load_background_img(uint8_t* buffer, int width, int height, int stride, int pixel_stride, int nb_passes) {
@@ -331,63 +330,68 @@ __global__ void load_background_img(uint8_t* buffer, int width, int height, int 
     rgb p = *pixel_ptr;
 
     int pixel_id = y * width + x;
-    reservoir* rs = d_global_rs + pixel_id * K;
+    int rs_stride = width * height;
 
-    int m_idx = find_matching_reservoir(p, rs);
+    int m_idx = find_matching_reservoir(p, rs_stride, pixel_id);
 
-    if (m_idx != -1 && rs[m_idx].w > 0) {
-        rs[m_idx].w += 1;
-        if (rs[m_idx].w > MAX_WEIGHTS) rs[m_idx].w = MAX_WEIGHTS;
-
-        rs[m_idx].r = ((rs[m_idx].w - 1) * rs[m_idx].r + p.r) / rs[m_idx].w;
-        rs[m_idx].g = ((rs[m_idx].w - 1) * rs[m_idx].g + p.g) / rs[m_idx].w;
-        rs[m_idx].b = ((rs[m_idx].w - 1) * rs[m_idx].b + p.b) / rs[m_idx].w;
-    }
-    else if (m_idx != -1 && rs[m_idx].w == 0) {
-        rs[m_idx].r = p.r;
-        rs[m_idx].g = p.g;
-        rs[m_idx].b = p.b;
-        rs[m_idx].w = 1;
-    }
-    else {
+    if (m_idx != -1) {
+        int off = m_idx * rs_stride + pixel_id;
+        int w = d_rs_w[off];
+        if (w > 0) {
+            w += 1;
+            if (w > MAX_WEIGHTS) w = MAX_WEIGHTS;
+            d_rs_r[off] = ((w - 1) * d_rs_r[off] + p.r) / w;
+            d_rs_g[off] = ((w - 1) * d_rs_g[off] + p.g) / w;
+            d_rs_b[off] = ((w - 1) * d_rs_b[off] + p.b) / w;
+            d_rs_w[off] = w;
+        } else {
+            d_rs_r[off] = p.r;
+            d_rs_g[off] = p.g;
+            d_rs_b[off] = p.b;
+            d_rs_w[off] = 1;
+        }
+    } else {
         int min_idx = 0;
         int total_weights = 0;
         for (int i = 0; i < K; ++i) {
-            total_weights += rs[i].w;
-            if (rs[i].w < rs[min_idx].w) {
+            int off = i * rs_stride + pixel_id;
+            total_weights += d_rs_w[off];
+            if (d_rs_w[off] < d_rs_w[min_idx * rs_stride + pixel_id]) {
                 min_idx = i;
             }
         }
 
         // Initialize unique state seed per pixel coordinate
-        uint32_t rng_state = (y * width + x + 1) ^ (nb_passes * 0x9E3779B9u);
+        uint32_t rng_state = (pixel_id + 1) ^ (nb_passes * 0x9E3779B9u);
         float rand_val = (float)(xorshift32(&rng_state) % 10000) / 10000.0f;
 
-        if (rand_val * total_weights >= rs[min_idx].w) {
-            rs[min_idx].r = p.r;
-            rs[min_idx].g = p.g;
-            rs[min_idx].b = p.b;
-            rs[min_idx].w = 1;
+        int min_off = min_idx * rs_stride + pixel_id;
+        if (rand_val * total_weights >= d_rs_w[min_off]) {
+            d_rs_r[min_off] = p.r;
+            d_rs_g[min_off] = p.g;
+            d_rs_b[min_off] = p.b;
+            d_rs_w[min_off] = 1;
         }
     }
 
-    // then cap weights to MAX_WEIGHTS
+    // Cap weights to MAX_WEIGHTS and find the dominant reservoir
     int max_weight_index = 0;
-    int max_weight = rs[0].w;
+    int max_weight = d_rs_w[pixel_id];
     for (int i = 1; i < K; ++i) {
-        if (rs[i].w > max_weight) {
-            max_weight = rs[i].w;
+        int off = i * rs_stride + pixel_id;
+        if (d_rs_w[off] > max_weight) {
+            max_weight = d_rs_w[off];
             max_weight_index = i;
         }
-        if (rs[i].w > MAX_WEIGHTS) {
-            rs[i].w = MAX_WEIGHTS;
+        if (d_rs_w[off] > MAX_WEIGHTS) {
+            d_rs_w[off] = MAX_WEIGHTS;
         }
     }
 
-    int bg_idx = pixel_id * 3;
-    d_background_img[bg_idx] = rs[max_weight_index].r;
-    d_background_img[bg_idx + 1] = rs[max_weight_index].g;
-    d_background_img[bg_idx + 2] = rs[max_weight_index].b;
+    int max_off = max_weight_index * rs_stride + pixel_id;
+    d_bg_r[pixel_id] = d_rs_r[max_off];
+    d_bg_g[pixel_id] = d_rs_g[max_off];
+    d_bg_b[pixel_id] = d_rs_b[max_off];
 }
 
 namespace
@@ -422,11 +426,24 @@ extern "C" {
         if (!initialized) {
             err = cudaDeviceSetLimit(cudaLimitMallocHeapSize, 256 * 1024 * 1024);
             CHECK_CUDA_ERROR(err);
-            uint8_t* tmp_bg;
-            err = cudaMalloc(&tmp_bg, width * height * 3 * sizeof(uint8_t));
+
+            // Background
+            uint8_t *tmp_bg_r;
+            err = cudaMalloc(&tmp_bg_r, width * height * sizeof(uint8_t));
             CHECK_CUDA_ERROR(err);
-            err = cudaMemcpyToSymbol(d_background_img, &tmp_bg, sizeof(tmp_bg));
+            uint8_t *tmp_bg_g;
+            err = cudaMalloc(&tmp_bg_g, width * height * sizeof(uint8_t));
             CHECK_CUDA_ERROR(err);
+            uint8_t *tmp_bg_b;
+            err = cudaMalloc(&tmp_bg_b, width * height * sizeof(uint8_t));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMemcpyToSymbol(d_bg_r, &tmp_bg_r, sizeof(tmp_bg_r));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMemcpyToSymbol(d_bg_g, &tmp_bg_g, sizeof(tmp_bg_g));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMemcpyToSymbol(d_bg_b, &tmp_bg_b, sizeof(tmp_bg_b));
+            CHECK_CUDA_ERROR(err);
+
             err = cudaMalloc(&d_motion_mask, width * height * sizeof(uint8_t));
             CHECK_CUDA_ERROR(err);
             err = cudaMalloc(&d_temp_mask, width * height * sizeof(uint8_t));
@@ -437,18 +454,33 @@ extern "C" {
             CHECK_CUDA_ERROR(err);
             err = cudaMalloc(&out, width * height * sizeof(bool));
             CHECK_CUDA_ERROR(err);
-            reservoir* d_rs_flat;
-            err = cudaMalloc(&d_rs_flat, width * height * K * sizeof(reservoir));
+
+            // Reservoirs
+            auto size_uint8 = width * height * K * sizeof(uint8_t);
+
+            uint8_t *tmp_rs_r;
+            err = cudaMalloc(&tmp_rs_r, size_uint8);
             CHECK_CUDA_ERROR(err);
-            err = cudaMemcpyToSymbol(d_global_rs, &d_rs_flat, sizeof(d_rs_flat));
+            uint8_t *tmp_rs_g;
+            err = cudaMalloc(&tmp_rs_g, size_uint8);
+            CHECK_CUDA_ERROR(err);
+            uint8_t *tmp_rs_b;
+            err = cudaMalloc(&tmp_rs_b, size_uint8);
+            CHECK_CUDA_ERROR(err);
+            int *tmp_rs_w;
+            err = cudaMalloc(&tmp_rs_w, width * height * K * sizeof(int));
             CHECK_CUDA_ERROR(err);
 
-            int init_threads = 256;
-            int init_blocks = (width * height + init_threads - 1) / init_threads;
-            init_reservoirs<<<init_blocks, init_threads>>>(d_rs_flat, width * height);
-            err = cudaDeviceSynchronize();
+            err = cudaMemcpyToSymbol(d_rs_r, &tmp_rs_r, sizeof(tmp_rs_r));
             CHECK_CUDA_ERROR(err);
-            err = cudaDeviceSynchronize();
+            err = cudaMemcpyToSymbol(d_rs_g, &tmp_rs_g, sizeof(tmp_rs_g));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMemcpyToSymbol(d_rs_b, &tmp_rs_b, sizeof(tmp_rs_b));
+            CHECK_CUDA_ERROR(err);
+            err = cudaMemcpyToSymbol(d_rs_w, &tmp_rs_w, sizeof(tmp_rs_w));
+            CHECK_CUDA_ERROR(err);
+
+            err = cudaMemset(tmp_rs_w, 0, width * height * K * sizeof(int));
             CHECK_CUDA_ERROR(err);
 
             initialized = true;
@@ -482,7 +514,10 @@ extern "C" {
         dim3 reconBlock(TILE, TILE);
         dim3 reconGrid((width + TILE - 1) / TILE, (height + TILE - 1) / TILE);
 
-        threshold_kernel<<<reconGrid, reconBlock>>>(d_motion_mask, input, marker, width * height);
+        int threads = 256;
+        int blocks = (width * height + threads - 1) / threads;
+
+        threshold_kernel<<<blocks, threads>>>(d_motion_mask, input, marker, width * height);
         cudaMemset(out, 0, width * height * sizeof(bool));
 
         bool host_changed;
@@ -494,7 +529,7 @@ extern "C" {
         } while (host_changed);
 
         // convert out to a uint8_t mask for computations
-        to_uint8_mask<<<reconGrid, reconBlock>>>(out, d_motion_mask, width * height);
+        to_uint8_mask<<<blocks, threads>>>(out, d_motion_mask, width * height);
         // superpose mask/frame with a red color
         masking<<<gridSize, blockSize>>>(dBuffer, d_motion_mask, width, height, pitch, pixel_stride);
 
