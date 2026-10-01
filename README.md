@@ -48,13 +48,8 @@ Run these steps from the project root, with a video named `data/video03.avi` in 
 
 ```sh
 export GST_PLUGIN_PATH=$(pwd)
-ln -sf ./build/libgstcudafilter-cpp.so libgstcudafilter.so
-```
-
-GStreamer finds the plugin through `GST_PLUGIN_PATH` and the `libgstcudafilter.so` symlink. To switch between the C++ and CUDA versions, point the symlink at the other `.so` in `./build` (list them with `ls build/*.so`):
-
-```sh
-ln -sf ./build/<your-cuda-plugin>.so libgstcudafilter.so
+# ln -sf ./build/libgstcudafilter-cpp.so libgstcudafilter.so <-- Used for the CPU version (slower)
+ln -sf ./build/libgstcudafilter-cu.so libgstcudafilter.so # <-- Used for the GPU-Optimized version
 ```
 
 Check that GStreamer sees it:
