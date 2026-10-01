@@ -89,6 +89,7 @@ static bool initialized = false;
 static int nb_passes = 0;
 static int nb_loop = 0;
 
+// Same deterministic random algo used in ISIM
 __device__ uint32_t xorshift32(uint32_t* state) {
     uint32_t x = *state;
     x ^= x << 13;
@@ -122,7 +123,7 @@ __global__ void masking(uint8_t* buffer, uint8_t *mask, int width, int height, i
 __global__ void threshold_kernel(uint8_t* diff, bool* input, bool* marker, int n) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < n) {
-        input[p]  = diff[p] >= HYSTERESIS_LOW;
+        input[p] = diff[p] >= HYSTERESIS_LOW;
         marker[p] = diff[p] >= HYSTERESIS_HIGH;
     }
 }
@@ -538,7 +539,6 @@ extern "C" {
         // Compute background
         // Get the movement filter
         movement_filter<<<gridSize, blockSize>>>(dBuffer, d_motion_mask, width, height, pitch, pixel_stride);
-        // Noise Suppression
         // Noise Suppression
         erode_h<<<gridSize, blockSize>>>(d_motion_mask, d_temp_mask,  width, height, OPENING_SIZE);
         erode_v<<<gridSize, blockSize>>>(d_temp_mask,  d_motion_mask, width, height, OPENING_SIZE);
